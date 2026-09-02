@@ -30,6 +30,8 @@ pub struct ProjectConfig {
 pub struct ZfsConfig {
     /// OpenZFS release tag, e.g. "zfs-2.2.7"
     pub tag: Option<String>,
+    /// "module" (default) builds loadable spl.ko/zfs.ko; "builtin" integrates into the kernel Image.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

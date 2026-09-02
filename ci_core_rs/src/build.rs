@@ -835,12 +835,30 @@ fn zfs_module_build_env(
     env
 }
 
-fn build_zfs_modules(
+fn zfs_integration_mode(zfs: &ZfsConfig) -> &str {
+    zfs.mode.as_deref().unwrap_or("module")
+}
+
+fn zfs_kernel_tree_root(kernel_source_path: &Path) -> Result<PathBuf> {
+    for candidate in ["common", "kernel_platform/common", "."] {
+        let path = kernel_source_path.join(candidate);
+        if path.join("fs/Kconfig").exists() {
+            return fs::canonicalize(&path)
+                .map_err(|err| anyhow!("Failed to canonicalize {:?}: {err}", path));
+        }
+    }
+    Err(anyhow!(
+        "Could not locate kernel tree root with fs/Kconfig under {:?}",
+        kernel_source_path
+    ))
+}
+
+fn prepare_zfs_source(
     kernel_source_path: &Path,
     build_env: &HashMap<String, String>,
     zfs: &ZfsConfig,
-    jobs: &str,
-) -> Result<(PathBuf, PathBuf)> {
+    builtin: bool,
+) -> Result<PathBuf> {
     let tag = zfs
         .tag
         .as_deref()
@@ -870,7 +888,6 @@ fn build_zfs_modules(
     let linux_obj = kernel_abs.join("out");
     let zfs_configure_env = zfs_configure_env(build_env);
 
-    // Android GKI exports page_pinner* as GPL-only; CDDL modules fail modpost without this.
     run_cmd_with_env(
         &["bash", "-c", "sed -i 's/^License:[[:space:]]*CDDL/License:       GPL/' META"],
         Some(&zfs_src),
@@ -883,12 +900,14 @@ fn build_zfs_modules(
         &zfs_configure_env,
     )?;
 
-    // Cross-build on x86_64 CI: force arm64 autoconf host so host SSE/AVX is not enabled.
-    let configure_cmd = format!(
-        "./configure --build=aarch64-linux-gnu --host=aarch64-linux-gnu --with-linux={} --with-linux-obj={}",
+    let mut configure_cmd = format!(
+        "./configure --build=aarch64-linux-gnu --host=aarch64-linux-gnu --with-config=kernel --with-linux={} --with-linux-obj={}",
         kernel_abs.display(),
         linux_obj.display()
     );
+    if builtin {
+        configure_cmd.push_str(" --enable-linux-builtin");
+    }
     run_cmd_with_env(
         &["bash", "-c", &configure_cmd],
         Some(&zfs_src),
@@ -906,6 +925,62 @@ fn build_zfs_modules(
         Some(&zfs_src),
         &zfs_configure_env,
     )?;
+
+    Ok(zfs_src)
+}
+
+fn integrate_zfs_builtin(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+    make_args: &[&str],
+    zfs: &ZfsConfig,
+    is_sm8850: bool,
+) -> Result<()> {
+    println!("Integrating OpenZFS into kernel source as built-in...");
+    let zfs_src = prepare_zfs_source(kernel_source_path, build_env, zfs, true)?;
+    let kernel_tree = zfs_kernel_tree_root(kernel_source_path)?;
+    let kernel_tree_str = kernel_tree
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid kernel tree path {:?}", kernel_tree))?;
+
+    run_cmd_with_env(
+        &["./copy-builtin", kernel_tree_str],
+        Some(&zfs_src),
+        &zfs_configure_env(build_env),
+    )?;
+
+    for cfg in ["ZFS", "ZLIB_INFLATE", "ZLIB_DEFLATE"] {
+        run_cmd(
+            &[
+                "scripts/config",
+                "--file",
+                "out/.config",
+                "-e",
+                cfg,
+            ],
+            Some(kernel_source_path),
+            false,
+        )?;
+    }
+
+    run_make_targets(
+        kernel_source_path,
+        build_env,
+        make_args,
+        &["olddefconfig"],
+        is_sm8850,
+    )?;
+    println!("OpenZFS built-in integration complete (CONFIG_ZFS=y)");
+    Ok(())
+}
+
+fn build_zfs_modules(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+    zfs: &ZfsConfig,
+    jobs: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let zfs_src = prepare_zfs_source(kernel_source_path, build_env, zfs, false)?;
 
     let zfs_module_env = zfs_module_build_env(build_env);
     let thread_count = jobs.trim_start_matches("-j");
@@ -1731,6 +1806,19 @@ pub fn handle_build(
     let threads = run_cmd(&["nproc"], None, true)?.unwrap().trim().to_string();
     let jobs = format!("-j{}", threads);
 
+    if let Some(ref zfs) = proj.zfs {
+        if zfs_integration_mode(zfs) == "builtin" {
+            integrate_zfs_builtin(
+                &kernel_source_path,
+                &build_env,
+                &make_args,
+                zfs,
+                is_sm8850,
+            )?;
+            feature_suffixes.push("zfs-builtin".to_string());
+        }
+    }
+
     if is_sm8850 {
         let mut cmd_str = format!(
             "source ./_setup_env.sh 2>/dev/null || true && make {} Image",
@@ -1769,17 +1857,19 @@ pub fn handle_build(
     fs::copy(image_path, "AnyKernel3/Image")?;
 
     if let Some(ref zfs) = proj.zfs {
-        println!("Building OpenZFS kernel modules...");
-        let (spl_ko, zfs_ko) =
-            build_zfs_modules(&kernel_source_path, &build_env, zfs, &jobs)?;
-        sign_kernel_modules(
-            &kernel_source_path,
-            &build_env,
-            &[spl_ko.as_path(), zfs_ko.as_path()],
-        )?;
-        package_zfs_modules(Path::new("AnyKernel3"), &spl_ko, &zfs_ko)?;
-        feature_suffixes.push("zfs".to_string());
-        println!("Packaged signed spl.ko and zfs.ko into AnyKernel3/zfs/");
+        if zfs_integration_mode(zfs) == "module" {
+            println!("Building OpenZFS kernel modules...");
+            let (spl_ko, zfs_ko) =
+                build_zfs_modules(&kernel_source_path, &build_env, zfs, &jobs)?;
+            sign_kernel_modules(
+                &kernel_source_path,
+                &build_env,
+                &[spl_ko.as_path(), zfs_ko.as_path()],
+            )?;
+            package_zfs_modules(Path::new("AnyKernel3"), &spl_ko, &zfs_ko)?;
+            feature_suffixes.push("zfs".to_string());
+            println!("Packaged signed spl.ko and zfs.ko into AnyKernel3/zfs/");
+        }
     }
 
     let hkt = FixedOffset::east_opt(8 * 3600).ok_or_else(|| anyhow!("Invalid HKT offset"))?;

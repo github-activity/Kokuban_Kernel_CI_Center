@@ -227,7 +227,8 @@
       "FIVE"
     ],
     "zfs": {
-      "tag": "zfs-2.2.7"
+      "tag": "zfs-2.2.7",
+      "mode": "builtin"
     }
   },
   "tabs10_mt6989": {
