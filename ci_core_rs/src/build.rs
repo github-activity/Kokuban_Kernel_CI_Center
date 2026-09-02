@@ -806,6 +806,14 @@ fn zfs_build_env(
     build_env: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut env = build_env.clone();
+    if let Some(path) = env.get("PATH") {
+        env.insert("PATH".to_string(), format!("/usr/bin:/bin:{path}"));
+    } else {
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+    }
+    env.insert("SED".to_string(), "/usr/bin/sed".to_string());
+    env.insert("M4".to_string(), "/usr/bin/m4".to_string());
+    env.insert("AWK".to_string(), "/usr/bin/gawk".to_string());
     env.insert("LLVM".to_string(), "1".to_string());
     env.insert("LLVM_IAS".to_string(), "1".to_string());
     env.insert("AR".to_string(), "llvm-ar".to_string());
