@@ -22,7 +22,7 @@ MUSL_CROSS_RELEASE="${MUSL_CROSS_RELEASE:-20260823}"
 ZLIB_VER="${ZLIB_VER:-1.3.1}"
 UTIL_LINUX_VER="${UTIL_LINUX_VER:-2.40.4}"
 TIRPC_VER="${TIRPC_VER:-1.3.6}"
-OPENSSL_VER="${OPENSSL_VER:-3.0.16}"
+OPENSSL_VER="${OPENSSL_VER:-3.5.8}"
 
 WORK="$PWD/.zfs_userland"
 SYSROOT="$WORK/sysroot"
@@ -35,7 +35,7 @@ cd "$WORK"
 log() { printf '\n=== %s\n' "$*"; }
 
 log "Fetching musl cross toolchain ($TRIPLE)"
-curl -fsSL -o musl-cross.tar.xz \
+curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o musl-cross.tar.xz \
   "https://github.com/cross-tools/musl-cross/releases/download/${MUSL_CROSS_RELEASE}/${TRIPLE}.tar.xz"
 tar xf musl-cross.tar.xz
 # Do not assume the archive's top-level directory name.
@@ -55,15 +55,34 @@ export CPPFLAGS="-I$SYSROOT/include"
 export LDFLAGS="-L$SYSROOT/lib"
 "$CC" --version | head -n1
 
-fetch() { curl -fsSL -o "src/$2" "$1" && tar xf "src/$2" -C src; }
+# Upstream project hosts go down (zlib.net was unreachable from the runner),
+# so every source has at least one mirror and the first one that answers wins.
+fetch() {
+  local archive="$1"; shift
+  local url
+  for url in "$@"; do
+    echo "  fetching $url"
+    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "src/$archive" "$url"; then
+      tar xf "src/$archive" -C src
+      return 0
+    fi
+    echo "  ... failed, trying next mirror" >&2
+  done
+  echo "all mirrors failed for $archive" >&2
+  return 1
+}
 
 log "Building zlib $ZLIB_VER"
-fetch "https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz" "zlib.tar.gz"
+fetch "zlib.tar.gz" \
+  "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz" \
+  "https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz"
 ( cd "src/zlib-${ZLIB_VER}" && ./configure --static --prefix="$SYSROOT" && make -j"$JOBS" && make install )
 
 log "Building util-linux $UTIL_LINUX_VER (libuuid + libblkid)"
 UL_SERIES="${UTIL_LINUX_VER%.*}"
-fetch "https://www.kernel.org/pub/linux/utils/util-linux/v${UL_SERIES}/util-linux-${UTIL_LINUX_VER}.tar.xz" "util-linux.tar.xz"
+fetch "util-linux.tar.xz" \
+  "https://www.kernel.org/pub/linux/utils/util-linux/v${UL_SERIES}/util-linux-${UTIL_LINUX_VER}.tar.xz" \
+  "https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v${UL_SERIES}/util-linux-${UTIL_LINUX_VER}.tar.xz"
 ( cd "src/util-linux-${UTIL_LINUX_VER}" && ./configure \
     --host="$TRIPLE" --prefix="$SYSROOT" \
     --disable-shared --enable-static \
@@ -72,14 +91,17 @@ fetch "https://www.kernel.org/pub/linux/utils/util-linux/v${UL_SERIES}/util-linu
   && make -j"$JOBS" && make install )
 
 log "Building libtirpc $TIRPC_VER"
-fetch "https://downloads.sourceforge.net/libtirpc/libtirpc-${TIRPC_VER}.tar.bz2" "libtirpc.tar.bz2"
+fetch "libtirpc.tar.bz2" \
+  "https://deb.debian.org/debian/pool/main/libt/libtirpc/libtirpc_${TIRPC_VER}.orig.tar.bz2" \
+  "https://downloads.sourceforge.net/libtirpc/libtirpc-${TIRPC_VER}.tar.bz2"
 ( cd "src/libtirpc-${TIRPC_VER}" && ./configure \
     --host="$TRIPLE" --prefix="$SYSROOT" \
     --disable-shared --enable-static --disable-gssapi \
   && make -j"$JOBS" && make install )
 
 log "Building OpenSSL $OPENSSL_VER (libcrypto)"
-fetch "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" "openssl.tar.gz"
+fetch "openssl.tar.gz" \
+  "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz"
 ( cd "src/openssl-${OPENSSL_VER}" && ./Configure linux-aarch64 \
     no-shared no-dso no-tests no-engine \
     --prefix="$SYSROOT" --openssldir="$SYSROOT/ssl" \
