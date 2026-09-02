@@ -229,7 +229,8 @@
     "zfs": {
       "tag": "zfs-2.4.4",
       "debug": false,
-      "simd": true
+      "simd": true,
+      "userland": true
     }
   },
   "tabs10_mt6989": {

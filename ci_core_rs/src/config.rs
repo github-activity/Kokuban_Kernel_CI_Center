@@ -36,6 +36,9 @@ pub struct ZfsConfig {
     /// checksum/raidz implementations and skip the SIMD benchmarks that run
     /// during module init.
     pub simd: Option<bool>,
+    /// Also cross-build a statically linked userland (zpool/zfs/zdb) against
+    /// musl and ship it alongside the modules. Default false.
+    pub userland: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
