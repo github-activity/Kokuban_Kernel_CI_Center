@@ -814,10 +814,20 @@ fn zfs_build_env(build_env: &HashMap<String, String>) -> HashMap<String, String>
     let mut env = build_env.clone();
 
     // Autotools needs the host toolchain, but it must never win over the
-    // kernel prebuilts, so append rather than prepend.
+    // kernel prebuilts, so append rather than prepend. (Prepending picks up
+    // host clang 18 over the prebuilt clang 17 and produces modules built by a
+    // different compiler than the kernel.)
     if let Some(path) = env.get("PATH").cloned() {
         env.insert("PATH".to_string(), format!("{path}:/usr/bin:/bin"));
     }
+
+    // Because the prebuilts come first, `sed` resolves to AOSP's
+    // build-tools/path shim, which rejects -i and makes configure bail with
+    // "sed does not support in-place". Point the autotools at the real host
+    // versions explicitly rather than reordering PATH.
+    env.insert("SED".to_string(), "/usr/bin/sed".to_string());
+    env.insert("M4".to_string(), "/usr/bin/m4".to_string());
+    env.insert("AWK".to_string(), "/usr/bin/gawk".to_string());
 
     env.insert("LLVM".to_string(), "1".to_string());
     env.insert("LLVM_IAS".to_string(), "1".to_string());
