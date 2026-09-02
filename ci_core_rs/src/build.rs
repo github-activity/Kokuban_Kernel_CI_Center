@@ -1553,6 +1553,8 @@ pub fn handle_build(
         } else {
             custom.to_string()
         }
+    } else if proj.include_variant_in_localversion == Some(false) {
+        proj.localversion_base.clone()
     } else {
         format!("{}-{}", proj.localversion_base, build_variant_suffix)
     };

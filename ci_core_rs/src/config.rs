@@ -22,6 +22,8 @@ pub struct ProjectConfig {
     pub bbg: Option<BbgConfig>,
     pub zfs: Option<ZfsConfig>,
     pub watch_upstream_variants: Option<Vec<String>>,
+    /// When false, LOCALVERSION uses localversion_base only (no LKM/ReSuki suffix).
+    pub include_variant_in_localversion: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

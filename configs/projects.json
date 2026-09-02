@@ -185,7 +185,8 @@
   "s24_sm8650": {
     "repo": "github-activity/android_kernel_samsung_sm8650",
     "defconfig": "defconfig",
-    "localversion_base": "-android14-Kokuban-Elysia-DZE1",
+    "localversion_base": "-android14",
+    "include_variant_in_localversion": false,
     "lto": "none",
     "supported_ksu": [
       "resukisu"
