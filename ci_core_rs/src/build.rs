@@ -847,6 +847,21 @@ fn zfs_tag(zfs: &ZfsConfig) -> &str {
         .unwrap_or(DEFAULT_ZFS_TAG)
 }
 
+/// Locate the generated zfs_config.h.
+///
+/// AC_CONFIG_HEADERS puts it at the top of the tree; some older in-tree paths
+/// expect include/zfs_config.h. Check both rather than guessing, because
+/// guessing wrong here fails silently and leaves SIMD enabled.
+fn zfs_config_header(zfs_src: &Path) -> Result<PathBuf> {
+    for candidate in ["zfs_config.h", "include/zfs_config.h"] {
+        let path = zfs_src.join(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(anyhow!("zfs_config.h not found under {:?}", zfs_src))
+}
+
 /// Remove `#define HAVE_KERNEL_NEON 1` from zfs_config.h.
 ///
 /// That single define is what makes `kfpu_allowed()` return 1 on arm64, which
@@ -857,7 +872,7 @@ fn zfs_tag(zfs: &ZfsConfig) -> &str {
 /// `valid()` predicate passes, before the parameter is ever consulted.  Turning
 /// the define off is the only load-time-free way to get a scalar-only module.
 fn zfs_disable_simd(zfs_src: &Path) -> Result<()> {
-    let header = zfs_src.join("include/zfs_config.h");
+    let header = zfs_config_header(zfs_src)?;
     let content = fs::read_to_string(&header)
         .map_err(|err| anyhow!("Failed to read {:?}: {err}", header))?;
 
@@ -1173,6 +1188,7 @@ fn save_zfs_diagnostics(dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)?;
 
     for (relative, name) in [
+        ("zfs_config.h", "zfs_config.h"),
         ("include/zfs_config.h", "zfs_config.h"),
         ("config.log", "zfs-configure.log"),
         ("module/Makefile", "zfs-module-Makefile"),
