@@ -532,6 +532,7 @@ fn handle_add(options: AddOptions) -> Result<()> {
         bbg: None,
         zfs: None,
         watch_upstream_variants: None,
+        include_variant_in_localversion: None,
     };
 
     projects.insert(options.key, serde_json::to_value(new_proj)?);
