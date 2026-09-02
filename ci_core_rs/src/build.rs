@@ -1808,6 +1808,13 @@ pub fn handle_build(
 
     if let Some(ref zfs) = proj.zfs {
         if zfs_integration_mode(zfs) == "builtin" {
+            run_make_targets(
+                &kernel_source_path,
+                &build_env,
+                &make_args,
+                &["prepare"],
+                is_sm8850,
+            )?;
             integrate_zfs_builtin(
                 &kernel_source_path,
                 &build_env,
