@@ -857,7 +857,15 @@ fn build_zfs_modules(
     let zfs_src = workspace.join("zfs");
     let kernel_abs = fs::canonicalize(kernel_source_path)?;
     let linux_obj = kernel_abs.join("out");
-    let zfs_env = zfs_build_env(build_env);
+    let mut zfs_env = zfs_build_env(build_env);
+    zfs_env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
+
+    // Android GKI exports page_pinner* as GPL-only; CDDL modules fail modpost without this.
+    run_cmd_with_env(
+        &["bash", "-c", "sed -i 's/^License:[[:space:]]*CDDL/License:       GPL/' META"],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
 
     run_cmd_with_env(
         &["bash", "-c", "if [ ! -f configure ]; then ./autogen.sh; fi"],
@@ -865,13 +873,20 @@ fn build_zfs_modules(
         &zfs_env,
     )?;
 
+    // Cross-build on x86_64 CI: force arm64 autoconf host so host SSE/AVX is not enabled.
     let configure_cmd = format!(
-        "./configure --with-linux={} --with-linux-obj={}",
+        "./configure --build=aarch64-linux-gnu --host=aarch64-linux-gnu --with-linux={} --with-linux-obj={}",
         kernel_abs.display(),
         linux_obj.display()
     );
     run_cmd_with_env(
         &["bash", "-c", &configure_cmd],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
+
+    run_cmd_with_env(
+        &["bash", "-c", r#"if [ -f include/zfs_config.h ]; then sed -i -E '/^#define HAVE_(SSE|SSE2|SSE3|SSSE3|SSE4_1|SSE4_2|AVX|AVX2|PCLMULQDQ|MOVBE|XSAVE)/d' include/zfs_config.h; fi"#],
         Some(&zfs_src),
         &zfs_env,
     )?;
