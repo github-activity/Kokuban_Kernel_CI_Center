@@ -802,25 +802,36 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
     Ok(())
 }
 
-fn zfs_build_env(
+fn zfs_configure_env(
     build_env: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut env = build_env.clone();
-    if let Some(path) = env.get("PATH") {
-        env.insert("PATH".to_string(), format!("/usr/bin:/bin:{path}"));
-    } else {
-        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
-    }
     env.insert("SED".to_string(), "/usr/bin/sed".to_string());
     env.insert("M4".to_string(), "/usr/bin/m4".to_string());
     env.insert("AWK".to_string(), "/usr/bin/gawk".to_string());
+    if let Some(path) = env.get("PATH") {
+        // Keep kernel prebuilt clang first; host autotools only as fallback.
+        env.insert("PATH".to_string(), format!("{path}:/usr/bin:/bin"));
+    }
+    env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
+    env.insert("KERNEL_LLVM".to_string(), "1".to_string());
+    if let Some(cc) = build_env.get("CC") {
+        env.insert("KERNEL_CC".to_string(), cc.clone());
+    }
+    env
+}
+
+fn zfs_module_build_env(
+    build_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = build_env.clone();
+    env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
+    env.insert("KERNEL_LLVM".to_string(), "1".to_string());
     env.insert("LLVM".to_string(), "1".to_string());
     env.insert("LLVM_IAS".to_string(), "1".to_string());
-    env.insert("AR".to_string(), "llvm-ar".to_string());
-    env.insert("NM".to_string(), "llvm-nm".to_string());
-    env.insert("OBJCOPY".to_string(), "llvm-objcopy".to_string());
-    env.insert("OBJDUMP".to_string(), "llvm-objdump".to_string());
-    env.insert("STRIP".to_string(), "llvm-strip".to_string());
+    if let Some(cc) = build_env.get("CC") {
+        env.insert("KERNEL_CC".to_string(), cc.clone());
+    }
     env
 }
 
@@ -857,20 +868,19 @@ fn build_zfs_modules(
     let zfs_src = workspace.join("zfs");
     let kernel_abs = fs::canonicalize(kernel_source_path)?;
     let linux_obj = kernel_abs.join("out");
-    let mut zfs_env = zfs_build_env(build_env);
-    zfs_env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
+    let zfs_configure_env = zfs_configure_env(build_env);
 
     // Android GKI exports page_pinner* as GPL-only; CDDL modules fail modpost without this.
     run_cmd_with_env(
         &["bash", "-c", "sed -i 's/^License:[[:space:]]*CDDL/License:       GPL/' META"],
         Some(&zfs_src),
-        &zfs_env,
+        &zfs_configure_env,
     )?;
 
     run_cmd_with_env(
         &["bash", "-c", "if [ ! -f configure ]; then ./autogen.sh; fi"],
         Some(&zfs_src),
-        &zfs_env,
+        &zfs_configure_env,
     )?;
 
     // Cross-build on x86_64 CI: force arm64 autoconf host so host SSE/AVX is not enabled.
@@ -882,24 +892,25 @@ fn build_zfs_modules(
     run_cmd_with_env(
         &["bash", "-c", &configure_cmd],
         Some(&zfs_src),
-        &zfs_env,
+        &zfs_configure_env,
     )?;
 
     run_cmd_with_env(
         &["bash", "-c", r#"if [ -f include/zfs_config.h ]; then sed -i -E '/^#define HAVE_(SSE|SSE2|SSE3|SSSE3|SSE4_1|SSE4_2|AVX|AVX2|PCLMULQDQ|MOVBE|XSAVE)/d' include/zfs_config.h; fi"#],
         Some(&zfs_src),
-        &zfs_env,
+        &zfs_configure_env,
     )?;
 
     run_cmd_with_env(
         &["bash", "-c", "./scripts/make_gitrev.sh include/zfs_gitrev.h"],
         Some(&zfs_src),
-        &zfs_env,
+        &zfs_configure_env,
     )?;
 
+    let zfs_module_env = zfs_module_build_env(build_env);
     let thread_count = jobs.trim_start_matches("-j");
     let make_cmd = format!("make -C module -j{thread_count}");
-    run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_env)?;
+    run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_module_env)?;
 
     let spl_ko = zfs_src.join("module/spl.ko");
     let zfs_ko = zfs_src.join("module/zfs.ko");
