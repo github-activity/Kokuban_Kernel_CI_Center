@@ -901,8 +901,8 @@ fn build_zfs_modules(
     let make_cmd = format!("make -C module -j{thread_count}");
     run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_env)?;
 
-    let spl_ko = zfs_src.join("module/spl/spl.ko");
-    let zfs_ko = zfs_src.join("module/zfs/zfs.ko");
+    let spl_ko = zfs_src.join("module/spl.ko");
+    let zfs_ko = zfs_src.join("module/zfs.ko");
     if !spl_ko.exists() {
         return Err(anyhow!("OpenZFS build did not produce spl.ko"));
     }
