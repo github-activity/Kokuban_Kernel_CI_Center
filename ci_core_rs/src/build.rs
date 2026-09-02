@@ -891,6 +891,12 @@ fn build_zfs_modules(
         &zfs_env,
     )?;
 
+    run_cmd_with_env(
+        &["bash", "-c", "./scripts/make_gitrev.sh include/zfs_gitrev.h"],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
+
     let thread_count = jobs.trim_start_matches("-j");
     let make_cmd = format!("make -C module -j{thread_count}");
     run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_env)?;
