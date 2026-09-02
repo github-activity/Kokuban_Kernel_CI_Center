@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::{AnyKernelConfig, BbgConfig, ProjectConfig, SusfsConfig};
+use crate::config::{AnyKernelConfig, BbgConfig, ProjectConfig, SusfsConfig, ZfsConfig};
 use crate::utils::{
     cache_file_name, command_exists, env_flag, file_sha256, handle_notify, is_resukisu_variant,
     load_anykernel_config, load_project, run_cmd, run_cmd_with_env, set_github_output,
@@ -15,6 +15,8 @@ use crate::utils::{
 
 const ANYKERNEL_REPO: &str = "https://github.com/YuzakiKokuban/AnyKernel3.git";
 const ANYKERNEL_BRANCH: &str = "master";
+const OPENZFS_REPO: &str = "https://github.com/openzfs/zfs.git";
+const DEFAULT_ZFS_TAG: &str = "zfs-2.2.7";
 
 fn verify_toolchain_checksum(
     url: &str,
@@ -800,6 +802,185 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
     Ok(())
 }
 
+fn zfs_build_env(
+    build_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = build_env.clone();
+    env.insert("LLVM".to_string(), "1".to_string());
+    env.insert("LLVM_IAS".to_string(), "1".to_string());
+    env.insert("AR".to_string(), "llvm-ar".to_string());
+    env.insert("NM".to_string(), "llvm-nm".to_string());
+    env.insert("OBJCOPY".to_string(), "llvm-objcopy".to_string());
+    env.insert("OBJDUMP".to_string(), "llvm-objdump".to_string());
+    env.insert("STRIP".to_string(), "llvm-strip".to_string());
+    env
+}
+
+fn build_zfs_modules(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+    zfs: &ZfsConfig,
+    jobs: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let tag = zfs
+        .tag
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ZFS_TAG);
+    let workspace = env::current_dir()?.join(".zfs_workspace");
+    if workspace.exists() {
+        fs::remove_dir_all(&workspace)?;
+    }
+    fs::create_dir_all(&workspace)?;
+
+    run_cmd(
+        &[
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            tag,
+            OPENZFS_REPO,
+            "zfs",
+        ],
+        Some(&workspace),
+        false,
+    )?;
+
+    let zfs_src = workspace.join("zfs");
+    let kernel_abs = fs::canonicalize(kernel_source_path)?;
+    let linux_obj = kernel_abs.join("out");
+    let configure_cmd = format!(
+        "./configure --with-linux={} --with-linux-obj={}",
+        kernel_abs.display(),
+        linux_obj.display()
+    );
+    let zfs_env = zfs_build_env(build_env);
+    run_cmd_with_env(
+        &["bash", "-c", &configure_cmd],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
+
+    let thread_count = jobs.trim_start_matches("-j");
+    let make_cmd = format!("make -j{thread_count}");
+    run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_env)?;
+
+    let spl_ko = zfs_src.join("module/spl/spl.ko");
+    let zfs_ko = zfs_src.join("module/zfs/zfs.ko");
+    if !spl_ko.exists() {
+        return Err(anyhow!("OpenZFS build did not produce spl.ko"));
+    }
+    if !zfs_ko.exists() {
+        return Err(anyhow!("OpenZFS build did not produce zfs.ko"));
+    }
+
+    Ok((spl_ko, zfs_ko))
+}
+
+fn module_sig_hash(kernel_source_path: &Path) -> Result<String> {
+    let config_path = kernel_source_path.join("out/.config");
+    let config = fs::read_to_string(&config_path)
+        .map_err(|_| anyhow!("Kernel config not found at {:?}", config_path))?;
+    for line in config.lines() {
+        if let Some(value) = line.strip_prefix("CONFIG_MODULE_SIG_HASH=") {
+            let hash = value.trim().trim_matches('"');
+            if hash.is_empty() {
+                break;
+            }
+            return Ok(hash.to_string());
+        }
+    }
+    Err(anyhow!("CONFIG_MODULE_SIG_HASH not found in {:?}", config_path))
+}
+
+fn resolve_sign_file(kernel_source_path: &Path) -> PathBuf {
+    let out_sign_file = kernel_source_path.join("out/scripts/sign-file");
+    if out_sign_file.exists() {
+        return out_sign_file;
+    }
+    kernel_source_path.join("scripts/sign-file")
+}
+
+fn ensure_sign_file(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+) -> Result<PathBuf> {
+    let sign_file = resolve_sign_file(kernel_source_path);
+    if sign_file.exists() {
+        return Ok(sign_file);
+    }
+
+    run_cmd_with_env(
+        &["make", "O=out", "scripts/sign-file"],
+        Some(kernel_source_path),
+        build_env,
+    )?;
+
+    let sign_file = resolve_sign_file(kernel_source_path);
+    if sign_file.exists() {
+        Ok(sign_file)
+    } else {
+        Err(anyhow!("Failed to build scripts/sign-file"))
+    }
+}
+
+fn sign_kernel_modules(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+    modules: &[&Path],
+) -> Result<()> {
+    let hash = module_sig_hash(kernel_source_path)?;
+    let key = kernel_source_path.join("out/certs/signing_key.pem");
+    let cert = kernel_source_path.join("out/certs/signing_key.x509");
+    if !key.exists() {
+        return Err(anyhow!("Module signing key not found at {:?}", key));
+    }
+    if !cert.exists() {
+        return Err(anyhow!("Module signing cert not found at {:?}", cert));
+    }
+
+    let sign_file = ensure_sign_file(kernel_source_path, build_env)?;
+    let sign_file_str = sign_file
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid sign-file path"))?;
+    let key_str = key
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid module signing key path"))?;
+    let cert_str = cert
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid module signing cert path"))?;
+
+    for module in modules {
+        let module_str = module
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid module path {:?}", module))?;
+        println!("Signing {} with {}", module.display(), hash);
+        run_cmd(
+            &[
+                sign_file_str,
+                &hash,
+                key_str,
+                cert_str,
+                module_str,
+            ],
+            None,
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn package_zfs_modules(anykernel_dir: &Path, spl_ko: &Path, zfs_ko: &Path) -> Result<()> {
+    let zfs_dir = anykernel_dir.join("zfs");
+    fs::create_dir_all(&zfs_dir)?;
+    fs::copy(spl_ko, zfs_dir.join("spl.ko"))?;
+    fs::copy(zfs_ko, zfs_dir.join("zfs.ko"))?;
+    Ok(())
+}
+
 fn apply_bbg_overlay(
     kernel_source_path: &Path,
     proj: &ProjectConfig,
@@ -1539,6 +1720,20 @@ pub fn handle_build(
     }
 
     fs::copy(image_path, "AnyKernel3/Image")?;
+
+    if let Some(ref zfs) = proj.zfs {
+        println!("Building OpenZFS kernel modules...");
+        let (spl_ko, zfs_ko) =
+            build_zfs_modules(&kernel_source_path, &build_env, zfs, &jobs)?;
+        sign_kernel_modules(
+            &kernel_source_path,
+            &build_env,
+            &[spl_ko.as_path(), zfs_ko.as_path()],
+        )?;
+        package_zfs_modules(Path::new("AnyKernel3"), &spl_ko, &zfs_ko)?;
+        feature_suffixes.push("zfs".to_string());
+        println!("Packaged signed spl.ko and zfs.ko into AnyKernel3/zfs/");
+    }
 
     let hkt = FixedOffset::east_opt(8 * 3600).ok_or_else(|| anyhow!("Invalid HKT offset"))?;
     let date_str = Utc::now()

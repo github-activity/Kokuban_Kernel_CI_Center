@@ -20,7 +20,14 @@ pub struct ProjectConfig {
     pub readme_placeholders: Option<HashMap<String, String>>,
     pub susfs: Option<SusfsConfig>,
     pub bbg: Option<BbgConfig>,
+    pub zfs: Option<ZfsConfig>,
     pub watch_upstream_variants: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ZfsConfig {
+    /// OpenZFS release tag, e.g. "zfs-2.2.7"
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

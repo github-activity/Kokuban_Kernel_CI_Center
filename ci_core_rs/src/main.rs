@@ -530,6 +530,7 @@ fn handle_add(options: AddOptions) -> Result<()> {
         readme_placeholders: Some(placeholders),
         susfs: None,
         bbg: None,
+        zfs: None,
         watch_upstream_variants: None,
     };
 

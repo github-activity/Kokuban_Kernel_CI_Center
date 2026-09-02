@@ -183,7 +183,7 @@
     ]
   },
   "s24_sm8650": {
-    "repo": "YuzakiKokuban/android_kernel_samsung_sm8650",
+    "repo": "github-activity/android_kernel_samsung_sm8650",
     "defconfig": "defconfig",
     "localversion_base": "-android14-Kokuban-Elysia-DZE1",
     "lto": "none",
@@ -224,7 +224,10 @@
       "SECURITY_DEFEX",
       "INTEGRITY",
       "FIVE"
-    ]
+    ],
+    "zfs": {
+      "tag": "zfs-2.2.7"
+    }
   },
   "tabs10_mt6989": {
     "repo": "YuzakiKokuban/android_kernel_samsung_mt6989_TabS10",
@@ -301,6 +304,9 @@
       "INTEGRITY",
       "FIVE"
     ],
+    "zfs": {
+      "tag": "zfs-2.2.7"
+    },
     "readme_placeholders": {
       "DEVICE_NAME_CN": "三星 Galaxy Z6 系列",
       "DEVICE_NAME_EN": "Samsung Galaxy Z6 Series"
