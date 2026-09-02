@@ -837,8 +837,6 @@ fn build_zfs_modules(
         &[
             "git",
             "clone",
-            "--depth",
-            "1",
             "--branch",
             tag,
             OPENZFS_REPO,
@@ -851,12 +849,19 @@ fn build_zfs_modules(
     let zfs_src = workspace.join("zfs");
     let kernel_abs = fs::canonicalize(kernel_source_path)?;
     let linux_obj = kernel_abs.join("out");
+    let zfs_env = zfs_build_env(build_env);
+
+    run_cmd_with_env(
+        &["bash", "-c", "if [ ! -f configure ]; then ./autogen.sh; fi"],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
+
     let configure_cmd = format!(
         "./configure --with-linux={} --with-linux-obj={}",
         kernel_abs.display(),
         linux_obj.display()
     );
-    let zfs_env = zfs_build_env(build_env);
     run_cmd_with_env(
         &["bash", "-c", &configure_cmd],
         Some(&zfs_src),
