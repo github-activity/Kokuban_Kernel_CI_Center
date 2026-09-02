@@ -1149,6 +1149,69 @@ fn sign_kernel_modules(
     Ok(())
 }
 
+/// Relax the page_pinner exports from EXPORT_SYMBOL_GPL to EXPORT_SYMBOL.
+///
+/// include/linux/mm.h inlines page_pinner_put_page(), which references
+/// __page_pinner_put_page() and page_pinner_inited. Both are EXPORT_SYMBOL_GPL,
+/// so modpost rejects any CDDL module that includes mm.h -- which is all of
+/// OpenZFS.
+///
+/// Turning CONFIG_PAGE_PINNER off instead does NOT work here: these are GKI
+/// stable-ABI symbols (android/abi_gki_aarch64_*), and the device's prebuilt
+/// vendor modules link against them. Removing them boots to the Samsung logo
+/// and dies. Keeping the symbols and changing only their license tag leaves the
+/// ABI byte-for-byte intact.
+fn relax_page_pinner_exports(kernel_source_path: &Path) -> Result<()> {
+    let source = find_first_existing_path(
+        kernel_source_path,
+        &[
+            "mm/page_pinner.c".to_string(),
+            "common/mm/page_pinner.c".to_string(),
+            "kernel_platform/common/mm/page_pinner.c".to_string(),
+        ],
+    );
+
+    let Some(source) = source else {
+        println!("mm/page_pinner.c not present; nothing to relax");
+        return Ok(());
+    };
+
+    let content = fs::read_to_string(&source)?;
+    let mut patched = content.clone();
+    let mut changed = 0;
+
+    for symbol in [
+        "page_pinner_inited",
+        "__page_pinner_failure_detect",
+        "__page_pinner_put_page",
+    ] {
+        let from = format!("EXPORT_SYMBOL_GPL({symbol});");
+        let to = format!("EXPORT_SYMBOL({symbol});");
+        if patched.contains(&from) {
+            patched = patched.replace(&from, &to);
+            changed += 1;
+        }
+    }
+
+    if changed == 0 {
+        if content.contains("EXPORT_SYMBOL(__page_pinner_put_page);") {
+            println!("page_pinner exports already relaxed");
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "Could not relax page_pinner exports in {:?}: no EXPORT_SYMBOL_GPL lines matched",
+            source
+        ));
+    }
+
+    fs::write(&source, patched)?;
+    println!(
+        "Relaxed {changed} page_pinner export(s) to EXPORT_SYMBOL in {}",
+        source.display()
+    );
+    Ok(())
+}
+
 fn package_zfs_modules(anykernel_dir: &Path, spl_ko: &Path, zfs_ko: &Path) -> Result<()> {
     let zfs_dir = anykernel_dir.join("zfs");
     fs::create_dir_all(&zfs_dir)?;
@@ -1670,6 +1733,10 @@ pub fn handle_build(
         feature_suffixes.push("bbg".to_string());
     }
 
+    if proj.zfs.is_some() {
+        relax_page_pinner_exports(&kernel_source_path)?;
+    }
+
     let kernel_version = capture_make_output(&kernel_source_path, "kernelversion", is_sm8850)?;
 
     let short_sha = run_cmd(
@@ -1804,14 +1871,6 @@ pub fn handle_build(
         }
     }
 
-    if proj.zfs.is_some() {
-        // include/linux/mm.h inlines page_pinner_put_page(), which calls the
-        // EXPORT_SYMBOL_GPL __page_pinner_put_page(). Every module that
-        // includes mm.h therefore has to be GPL, and OpenZFS is CDDL. Dropping
-        // this debug feature is what lets the modules keep an honest license
-        // instead of relabelling the OpenZFS META as GPL to fool modpost.
-        disable_configs.push("PAGE_PINNER");
-    }
 
     for config in disable_configs {
         run_cmd(
