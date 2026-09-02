@@ -929,6 +929,22 @@ fn prepare_zfs_source(
     Ok(zfs_src)
 }
 
+fn patch_zfs_builtin_kbuild(kernel_tree: &Path) -> Result<()> {
+    let kbuild = kernel_tree.join("fs/zfs/Kbuild");
+    if !kbuild.exists() {
+        return Err(anyhow!("OpenZFS Kbuild not found at {:?}", kbuild));
+    }
+    let mut content = fs::read_to_string(&kbuild)?;
+    if !content.contains("ccflags-y += -I$(icp_include)") {
+        content = content.replace(
+            "ccflags-y := $(ZFS_MODULE_CFLAGS) $(ZFS_MODULE_CPPFLAGS)",
+            "ccflags-y := $(ZFS_MODULE_CFLAGS) $(ZFS_MODULE_CPPFLAGS)\nccflags-y += -I$(icp_include)",
+        );
+        fs::write(&kbuild, content)?;
+    }
+    Ok(())
+}
+
 fn integrate_zfs_builtin(
     kernel_source_path: &Path,
     build_env: &HashMap<String, String>,
@@ -948,6 +964,8 @@ fn integrate_zfs_builtin(
         Some(&zfs_src),
         &zfs_configure_env(build_env),
     )?;
+
+    patch_zfs_builtin_kbuild(&kernel_tree)?;
 
     for cfg in ["ZFS", "ZLIB_INFLATE", "ZLIB_DEFLATE"] {
         run_cmd(
