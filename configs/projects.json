@@ -227,7 +227,9 @@
       "FIVE"
     ],
     "zfs": {
-      "tag": "zfs-2.2.7"
+      "tag": "zfs-2.4.4",
+      "debug": false,
+      "simd": true
     }
   },
   "tabs10_mt6989": {
@@ -306,7 +308,9 @@
       "FIVE"
     ],
     "zfs": {
-      "tag": "zfs-2.2.7"
+      "tag": "zfs-2.4.4",
+      "debug": false,
+      "simd": true
     },
     "readme_placeholders": {
       "DEVICE_NAME_CN": "三星 Galaxy Z6 系列",

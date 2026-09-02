@@ -16,7 +16,7 @@ use crate::utils::{
 const ANYKERNEL_REPO: &str = "https://github.com/YuzakiKokuban/AnyKernel3.git";
 const ANYKERNEL_BRANCH: &str = "master";
 const OPENZFS_REPO: &str = "https://github.com/openzfs/zfs.git";
-const DEFAULT_ZFS_TAG: &str = "zfs-2.2.7";
+const DEFAULT_ZFS_TAG: &str = "zfs-2.4.4";
 
 fn verify_toolchain_checksum(
     url: &str,
@@ -802,60 +802,99 @@ fn apply_susfs_overlay(kernel_source_path: &Path, susfs: &SusfsConfig) -> Result
     Ok(())
 }
 
-fn zfs_configure_env(
-    build_env: &HashMap<String, String>,
-) -> HashMap<String, String> {
+/// Environment for both `./configure` and `make -C module`.
+///
+/// OpenZFS consumes KERNEL_CC / KERNEL_LD / KERNEL_LLVM as autoconf precious
+/// variables (`AC_ARG_VAR`), substitutes them into `module/Makefile`, and then
+/// replays them at build time.  They therefore have to be correct at *configure*
+/// time; setting them later is a no-op.  Everything else (ARCH, CROSS_COMPILE,
+/// KCFLAGS, ...) is inherited from the kernel build env so the modules are
+/// compiled exactly like the in-tree ones -- same clang, same CFI, same SCS.
+fn zfs_build_env(build_env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut env = build_env.clone();
-    env.insert("SED".to_string(), "/usr/bin/sed".to_string());
-    env.insert("M4".to_string(), "/usr/bin/m4".to_string());
-    env.insert("AWK".to_string(), "/usr/bin/gawk".to_string());
-    if let Some(path) = env.get("PATH") {
-        // Keep kernel prebuilt clang first; host autotools only as fallback.
+
+    // Autotools needs the host toolchain, but it must never win over the
+    // kernel prebuilts, so append rather than prepend.
+    if let Some(path) = env.get("PATH").cloned() {
         env.insert("PATH".to_string(), format!("{path}:/usr/bin:/bin"));
     }
-    env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
-    env.insert("KERNEL_LLVM".to_string(), "1".to_string());
-    if let Some(cc) = build_env.get("CC") {
-        env.insert("KERNEL_CC".to_string(), cc.clone());
-    }
-    env
-}
 
-fn zfs_module_build_env(
-    build_env: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut env = build_env.clone();
-    env.insert("KERNEL_ARCH".to_string(), "arm64".to_string());
-    env.insert("KERNEL_LLVM".to_string(), "1".to_string());
     env.insert("LLVM".to_string(), "1".to_string());
     env.insert("LLVM_IAS".to_string(), "1".to_string());
+    env.insert("KERNEL_LLVM".to_string(), "1".to_string());
     if let Some(cc) = build_env.get("CC") {
         env.insert("KERNEL_CC".to_string(), cc.clone());
     }
+    env.insert("KERNEL_LD".to_string(), "ld.lld".to_string());
     env
 }
 
-fn build_zfs_modules(
+fn zfs_tag(zfs: &ZfsConfig) -> &str {
+    zfs.tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ZFS_TAG)
+}
+
+/// Remove `#define HAVE_KERNEL_NEON 1` from zfs_config.h.
+///
+/// That single define is what makes `kfpu_allowed()` return 1 on arm64, which
+/// in turn makes `fletcher_4_init()` and `vdev_raidz_math_init()` execute NEON
+/// kernels inside `kernel_neon_begin()/end()` while the module is still
+/// initialising.  The `zfs_fletcher_4_impl` / `zfs_vdev_raidz_impl` module
+/// parameters do *not* gate that -- the benchmark loops over every impl whose
+/// `valid()` predicate passes, before the parameter is ever consulted.  Turning
+/// the define off is the only load-time-free way to get a scalar-only module.
+fn zfs_disable_simd(zfs_src: &Path) -> Result<()> {
+    let header = zfs_src.join("include/zfs_config.h");
+    let content = fs::read_to_string(&header)
+        .map_err(|err| anyhow!("Failed to read {:?}: {err}", header))?;
+
+    let filtered: Vec<&str> = content
+        .lines()
+        .filter(|line| !line.starts_with("#define HAVE_KERNEL_NEON"))
+        .collect();
+
+    if filtered.len() == content.lines().count() {
+        // Nothing matched: either configure already decided NEON was
+        // unavailable, or the define was renamed upstream.  Only the second
+        // case is a problem, and it is worth a loud failure rather than a
+        // module that silently keeps SIMD enabled.
+        if !content.contains("HAVE_KERNEL_NEON") {
+            println!("SIMD already disabled by configure (no HAVE_KERNEL_NEON)");
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "Could not disable SIMD: HAVE_KERNEL_NEON present in {:?} but not as a #define",
+            header
+        ));
+    }
+
+    fs::write(&header, filtered.join("\n") + "\n")?;
+    println!("Disabled arm64 SIMD (removed HAVE_KERNEL_NEON from zfs_config.h)");
+    Ok(())
+}
+
+fn prepare_zfs_source(
     kernel_source_path: &Path,
     build_env: &HashMap<String, String>,
     zfs: &ZfsConfig,
-    jobs: &str,
-) -> Result<(PathBuf, PathBuf)> {
-    let tag = zfs
-        .tag
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_ZFS_TAG);
+) -> Result<PathBuf> {
+    let tag = zfs_tag(zfs);
     let workspace = env::current_dir()?.join(".zfs_workspace");
     if workspace.exists() {
         fs::remove_dir_all(&workspace)?;
     }
     fs::create_dir_all(&workspace)?;
 
+    println!("Fetching OpenZFS {tag}...");
     run_cmd(
         &[
             "git",
             "clone",
+            "--depth",
+            "1",
             "--branch",
             tag,
             OPENZFS_REPO,
@@ -868,60 +907,127 @@ fn build_zfs_modules(
     let zfs_src = workspace.join("zfs");
     let kernel_abs = fs::canonicalize(kernel_source_path)?;
     let linux_obj = kernel_abs.join("out");
-    let zfs_configure_env = zfs_configure_env(build_env);
+    let zfs_env = zfs_build_env(build_env);
 
-    // Android GKI exports page_pinner* as GPL-only; CDDL modules fail modpost without this.
-    run_cmd_with_env(
-        &["bash", "-c", "sed -i 's/^License:[[:space:]]*CDDL/License:       GPL/' META"],
-        Some(&zfs_src),
-        &zfs_configure_env,
-    )?;
+    run_cmd_with_env(&["bash", "-c", "./autogen.sh"], Some(&zfs_src), &zfs_env)?;
 
-    run_cmd_with_env(
-        &["bash", "-c", "if [ ! -f configure ]; then ./autogen.sh; fi"],
-        Some(&zfs_src),
-        &zfs_configure_env,
-    )?;
-
-    // Cross-build on x86_64 CI: force arm64 autoconf host so host SSE/AVX is not enabled.
-    let configure_cmd = format!(
-        "./configure --build=aarch64-linux-gnu --host=aarch64-linux-gnu --with-linux={} --with-linux-obj={}",
+    // Honest cross-compile triple.  Claiming build == host would make autoconf
+    // set cross_compiling=no and happily *run* x86_64 test binaries while
+    // believing they are aarch64.
+    let mut configure_cmd = format!(
+        "./configure --build=x86_64-pc-linux-gnu --host=aarch64-linux-gnu \
+         --with-config=kernel --with-linux={} --with-linux-obj={}",
         kernel_abs.display(),
         linux_obj.display()
     );
-    run_cmd_with_env(
-        &["bash", "-c", &configure_cmd],
-        Some(&zfs_src),
-        &zfs_configure_env,
+    if zfs.debug.unwrap_or(false) {
+        // ASSERT/VERIFY turn silent corruption into a named assertion with a
+        // file:line, which is worth the performance cost while bringing this up.
+        configure_cmd.push_str(" --enable-debug --enable-debuginfo");
+    }
+
+    run_cmd_with_env(&["bash", "-c", &configure_cmd], Some(&zfs_src), &zfs_env)?;
+
+    if !zfs.simd.unwrap_or(true) {
+        zfs_disable_simd(&zfs_src)?;
+    }
+
+    // Shallow clones have no tags, so make_gitrev.sh cannot describe HEAD.
+    // Write the release we asked for instead of letting it fall back to
+    // "unknown", which ends up in `zpool version`.
+    fs::write(
+        zfs_src.join("include/zfs_gitrev.h"),
+        format!("#define\tZFS_META_GITREV \"{tag}\"\n"),
     )?;
 
-    run_cmd_with_env(
-        &["bash", "-c", r#"if [ -f include/zfs_config.h ]; then sed -i -E '/^#define HAVE_(SSE|SSE2|SSE3|SSSE3|SSE4_1|SSE4_2|AVX|AVX2|PCLMULQDQ|MOVBE|XSAVE)/d' include/zfs_config.h; fi"#],
-        Some(&zfs_src),
-        &zfs_configure_env,
-    )?;
+    Ok(zfs_src)
+}
 
-    run_cmd_with_env(
-        &["bash", "-c", "./scripts/make_gitrev.sh include/zfs_gitrev.h"],
-        Some(&zfs_src),
-        &zfs_configure_env,
-    )?;
+fn build_zfs_modules(
+    kernel_source_path: &Path,
+    build_env: &HashMap<String, String>,
+    zfs: &ZfsConfig,
+    jobs: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let zfs_src = prepare_zfs_source(kernel_source_path, build_env, zfs)?;
+    let zfs_env = zfs_build_env(build_env);
 
-    let zfs_module_env = zfs_module_build_env(build_env);
     let thread_count = jobs.trim_start_matches("-j");
-    let make_cmd = format!("make -C module -j{thread_count}");
-    run_cmd_with_env(&["bash", "-c", &make_cmd], Some(&zfs_src), &zfs_module_env)?;
+    run_cmd_with_env(
+        &["bash", "-c", &format!("make -C module -j{thread_count}")],
+        Some(&zfs_src),
+        &zfs_env,
+    )?;
 
+    // OpenZFS >= 2.1 consolidates zavl/znvpair/zcommon/zunicode/zlua/icp into
+    // zfs.ko, so exactly two modules is the expected output.
     let spl_ko = zfs_src.join("module/spl.ko");
     let zfs_ko = zfs_src.join("module/zfs.ko");
-    if !spl_ko.exists() {
-        return Err(anyhow!("OpenZFS build did not produce spl.ko"));
-    }
-    if !zfs_ko.exists() {
-        return Err(anyhow!("OpenZFS build did not produce zfs.ko"));
+    for module in [&spl_ko, &zfs_ko] {
+        if !module.exists() {
+            return Err(anyhow!("OpenZFS build did not produce {:?}", module));
+        }
     }
 
+    verify_zfs_vermagic(kernel_source_path, &[spl_ko.as_path(), zfs_ko.as_path()])?;
+
     Ok((spl_ko, zfs_ko))
+}
+
+/// Fail the build if the modules would be rejected by the kernel we just built.
+///
+/// A vermagic mismatch is the difference between `insmod` printing a clear
+/// error and a build that looks green but ships modules nobody can load.
+fn verify_zfs_vermagic(kernel_source_path: &Path, modules: &[&Path]) -> Result<()> {
+    let release_path = kernel_source_path.join("out/include/config/kernel.release");
+    let expected = match fs::read_to_string(&release_path) {
+        Ok(value) => value.trim().to_string(),
+        Err(_) => {
+            println!("Skipping vermagic check: {:?} not found", release_path);
+            return Ok(());
+        }
+    };
+
+    for module in modules {
+        let module_str = module
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid module path {:?}", module))?;
+        let vermagic = run_cmd(
+            &[
+                "bash",
+                "-c",
+                &format!("strings {module_str} | grep -m1 '^vermagic=' || true"),
+            ],
+            None,
+            true,
+        )?
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+        if vermagic.is_empty() {
+            println!("Could not read vermagic from {}", module.display());
+            continue;
+        }
+        println!("{}: {}", module.display(), vermagic);
+
+        let actual = vermagic
+            .trim_start_matches("vermagic=")
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(anyhow!(
+                "vermagic mismatch for {}: module has '{}', kernel is '{}'",
+                module.display(),
+                actual,
+                expected
+            ));
+        }
+    }
+
+    println!("vermagic matches kernel release {expected}");
+    Ok(())
 }
 
 fn module_sig_hash(kernel_source_path: &Path) -> Result<String> {
@@ -1023,6 +1129,50 @@ fn package_zfs_modules(anykernel_dir: &Path, spl_ko: &Path, zfs_ko: &Path) -> Re
     fs::create_dir_all(&zfs_dir)?;
     fs::copy(spl_ko, zfs_dir.join("spl.ko"))?;
     fs::copy(zfs_ko, zfs_dir.join("zfs.ko"))?;
+
+    // AnyKernel3 does not install these (the pineapple profile sets
+    // modules=false, and "zfs" is not a directory it knows about), so spell out
+    // the manual steps next to the files instead of leaving them unexplained.
+    fs::write(
+        zfs_dir.join("README.txt"),
+        "OpenZFS kernel modules for this build.\n\
+         \n\
+         These are NOT installed by the flashing script. Copy them to the device\n\
+         and load them by hand, spl.ko first:\n\
+         \n\
+             adb push spl.ko zfs.ko /data/adb/zfs/\n\
+             adb shell su -c 'insmod /data/adb/zfs/spl.ko'\n\
+             adb shell su -c 'insmod /data/adb/zfs/zfs.ko'\n\
+         \n\
+         They are signed with the ephemeral key generated by this specific build,\n\
+         so they only load into the kernel shipped in the same zip.\n\
+         \n\
+         No userland (zfs/zpool/zdb) is built yet, so pools cannot be created or\n\
+         imported with this zip alone.\n",
+    )?;
+    Ok(())
+}
+
+/// Copy configure/build output out of the scratch workspace so a failed or
+/// crashing build leaves something to read.
+fn save_zfs_diagnostics(dest: &Path) -> Result<()> {
+    let zfs_src = env::current_dir()?.join(".zfs_workspace/zfs");
+    if !zfs_src.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(dest)?;
+
+    for (relative, name) in [
+        ("include/zfs_config.h", "zfs_config.h"),
+        ("config.log", "zfs-configure.log"),
+        ("module/Makefile", "zfs-module-Makefile"),
+    ] {
+        let source = zfs_src.join(relative);
+        if source.exists() {
+            let _ = fs::copy(&source, dest.join(name));
+        }
+    }
+    println!("Saved OpenZFS diagnostics to {}", dest.display());
     Ok(())
 }
 
@@ -1628,6 +1778,15 @@ pub fn handle_build(
         }
     }
 
+    if proj.zfs.is_some() {
+        // include/linux/mm.h inlines page_pinner_put_page(), which calls the
+        // EXPORT_SYMBOL_GPL __page_pinner_put_page(). Every module that
+        // includes mm.h therefore has to be GPL, and OpenZFS is CDDL. Dropping
+        // this debug feature is what lets the modules keep an honest license
+        // instead of relabelling the OpenZFS META as GPL to fool modpost.
+        disable_configs.push("PAGE_PINNER");
+    }
+
     for config in disable_configs {
         run_cmd(
             &[
@@ -1769,9 +1928,10 @@ pub fn handle_build(
     fs::copy(image_path, "AnyKernel3/Image")?;
 
     if let Some(ref zfs) = proj.zfs {
-        println!("Building OpenZFS kernel modules...");
-        let (spl_ko, zfs_ko) =
-            build_zfs_modules(&kernel_source_path, &build_env, zfs, &jobs)?;
+        println!("Building OpenZFS {} kernel modules...", zfs_tag(zfs));
+        let result = build_zfs_modules(&kernel_source_path, &build_env, zfs, &jobs);
+        let _ = save_zfs_diagnostics(Path::new("zfs_diagnostics"));
+        let (spl_ko, zfs_ko) = result?;
         sign_kernel_modules(
             &kernel_source_path,
             &build_env,
@@ -1887,6 +2047,12 @@ pub fn handle_collect_artifacts(artifact_dir: String) -> Result<()> {
         "kernel_source/out/vmlinux.symvers",
     ] {
         has_artifacts |= copy_artifact_if_exists(Path::new(extra_artifact), &artifact_dir)?;
+    }
+
+    if Path::new("zfs_diagnostics").is_dir() {
+        for entry in fs::read_dir("zfs_diagnostics")? {
+            has_artifacts |= copy_artifact_if_exists(&entry?.path(), &artifact_dir)?;
+        }
     }
 
     set_github_output(

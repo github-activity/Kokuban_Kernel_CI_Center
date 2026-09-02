@@ -28,8 +28,14 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ZfsConfig {
-    /// OpenZFS release tag, e.g. "zfs-2.2.7"
+    /// OpenZFS release tag, e.g. "zfs-2.4.4". Defaults to DEFAULT_ZFS_TAG.
     pub tag: Option<String>,
+    /// Build with --enable-debug --enable-debuginfo (ASSERT/VERIFY on). Default false.
+    pub debug: Option<bool>,
+    /// Allow arm64 NEON code paths. Default true. Set false to force scalar
+    /// checksum/raidz implementations and skip the SIMD benchmarks that run
+    /// during module init.
+    pub simd: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
